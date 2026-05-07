@@ -42,6 +42,11 @@ log_step() {
     echo -e "${CYAN}[STEP]${NC} $1"
 }
 
+find_versions() {
+    local indent=$(printf "%*s" $((${1:-0} * 2)));
+    find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -exec sh -c 'echo "'"$indent"'$(basename {})"' \; | sort -V
+}
+
 # Display authentication information for first-time setup
 show_authentication_info() {
     echo
@@ -704,7 +709,7 @@ cleanup_old_versions() {
     
     # Get all version directories, sort them, and remove all but the latest 2
     local old_versions
-    old_versions=$(find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -printf "%f\n" | sort -V | head -n -2)
+    old_versions=$(find_versions | head -n -2)
     
     if [[ -n "$old_versions" ]]; then
         echo "$old_versions" | while read -r version; do
@@ -903,7 +908,7 @@ show_status() {
         # Show available versions
         if [[ -d "$INSTALL_DIR" ]]; then
             echo "Installed Versions:"
-            find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -printf "  %f\n" | sort -V
+            find_versions 1
         fi
     else
         echo "Status: Not installed"
