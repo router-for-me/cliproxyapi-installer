@@ -529,17 +529,19 @@ start_service() {
     fi
 }
 
-# Restart systemd service
+# Restart systemd service (returns non-zero on failure)
 restart_service() {
     log_info "Restarting CLIProxyAPI service..."
     systemctl --user restart cliproxyapi.service
-    
+
     # Wait a moment and check if it started successfully
     sleep 2
     if is_service_running; then
         log_success "Service restarted successfully"
+        return 0
     else
         log_warning "Service may not have started properly. Check with: systemctl --user status cliproxyapi.service"
+        return 1
     fi
 }
 
@@ -649,25 +651,61 @@ setup_config() {
     fi
 }
 
-# Download file
+# Download file with retry
 download_file() {
     local url="$1"
     local output="$2"
-    
+    local max_retries="${3:-3}"
+    local retry_delay=5
+    local attempt=1
+
     log_info "Downloading $(basename "$url")..."
-    
-    if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$output" "$url"
-    else
-        wget -O "$output" "$url"
+
+    while [[ $attempt -le $max_retries ]]; do
+        if [[ $attempt -gt 1 ]]; then
+            log_warning "Download attempt $attempt of $max_retries (retrying in ${retry_delay}s)..."
+            sleep "$retry_delay"
+            retry_delay=$((retry_delay * 2))  # exponential backoff
+        fi
+
+        if command -v curl >/dev/null 2>&1; then
+            curl -L --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 -o "$output" "$url"
+        else
+            wget -O "$output" "$url"
+        fi
+
+        if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+            log_success "Download completed"
+            return 0
+        fi
+
+        log_warning "Download attempt $attempt failed"
+        rm -f "$output"
+        attempt=$((attempt + 1))
+    done
+
+    log_error "Failed to download file after $max_retries attempts"
+    return 1
+}
+
+# Verify download integrity
+verify_download() {
+    local archive="$1"
+
+    if [[ ! -f "$archive" ]] || [[ ! -s "$archive" ]]; then
+        log_error "Downloaded file is missing or empty"
+        return 1
     fi
-    
-    if [[ ! -f "$output" ]]; then
-        log_error "Failed to download file"
-        exit 1
+
+    # Verify tar.gz integrity by listing contents
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        log_error "Downloaded archive is corrupted (failed tar integrity check)"
+        rm -f "$archive"
+        return 1
     fi
-    
-    log_success "Download completed"
+
+    log_success "Download integrity verified"
+    return 0
 }
 
 # Extract tar.gz archive
@@ -728,17 +766,50 @@ make_executable() {
     fi
 }
 
+# Rollback to previous version on failure
+rollback_upgrade() {
+    local old_version="$1"
+    local old_binary_backup="$2"
+
+    log_warning "Rolling back to version $old_version..."
+
+    # Restore old binary
+    if [[ -n "$old_binary_backup" ]] && [[ -f "$old_binary_backup" ]]; then
+        cp "$old_binary_backup" "${INSTALL_DIR}/cli-proxy-api"
+        chmod +x "${INSTALL_DIR}/cli-proxy-api"
+        log_info "Restored previous binary"
+    fi
+
+    # Restore old version file
+    if [[ -n "$old_version" ]] && [[ "$old_version" != "none" ]]; then
+        echo "$old_version" > "${INSTALL_DIR}/version.txt"
+        log_info "Restored version.txt to $old_version"
+    fi
+
+    # Try to restart old service
+    if systemctl --user start cliproxyapi.service 2>/dev/null; then
+        sleep 2
+        if is_service_running; then
+            log_success "Service restored and running (version $old_version)"
+        else
+            log_warning "Service restored but may not be running. Check: systemctl --user status cliproxyapi.service"
+        fi
+    else
+        log_warning "Could not restart service. Run manually: systemctl --user start cliproxyapi.service"
+    fi
+}
+
 # Main installation function
 install_cliproxyapi() {
     local current_version
     current_version=$(get_current_version)
     local is_upgrade=false
     local service_was_running=false
-    
+
     if [[ "$current_version" != "none" ]]; then
         log_info "Current CLIProxyAPI version: $current_version"
         is_upgrade=true
-        
+
         # Check if service is running before upgrade
         if is_service_running; then
             service_was_running=true
@@ -747,34 +818,103 @@ install_cliproxyapi() {
     else
         log_info "CLIProxyAPI not installed, performing fresh installation"
     fi
-    
+
     # Check dependencies
     check_dependencies
-    
+
     # Detect Linux architecture
     local os_arch
     os_arch=$(detect_linux_arch)
     log_step "Detected platform: $os_arch"
-    
+
     # Fetch release info
     local release_info
     release_info=$(fetch_release_info)
-    
+
     # Extract version and download URL
     local release_data
     release_data=$(extract_release_info "$release_info" "$os_arch")
     local version=$(echo "$release_data" | cut -d'|' -f1)
     local download_url=$(echo "$release_data" | cut -d'|' -f2)
-    
+
     log_step "Latest version: $version"
-    
+
     # Check if already up to date
     if [[ "$is_upgrade" == true && "$current_version" == "$version" ]]; then
         log_success "CLIProxyAPI is already up to date (version $version)"
         return
     fi
-    
-    # Stop service and processes if running (for upgrades)
+
+    # ============================================================
+    # PHASE 1: Download and prepare new version (service still running)
+    # ============================================================
+    local version_dir="${INSTALL_DIR}/${version}"
+    mkdir -p "$INSTALL_DIR"
+
+    # Backup current binary for rollback (before any destructive action)
+    local old_binary_backup=""
+    if [[ "$is_upgrade" == true ]] && [[ -f "${INSTALL_DIR}/cli-proxy-api" ]]; then
+        old_binary_backup="${INSTALL_DIR}/.cli-proxy-api.rollback"
+        cp "${INSTALL_DIR}/cli-proxy-api" "$old_binary_backup"
+        log_info "Backed up current binary for rollback"
+    fi
+
+    # Download new version (service is still running during this phase)
+    local temp_file
+    temp_file=$(mktemp)
+    OUR_TEMP_FILES+=("$temp_file")
+
+    if ! download_file "$download_url" "$temp_file"; then
+        log_error "Download failed. Service is still running - no disruption occurred."
+        rm -f "$temp_file" "$old_binary_backup"
+        exit 1
+    fi
+
+    # Verify download integrity
+    if ! verify_download "$temp_file"; then
+        log_error "Download verification failed. Service is still running - no disruption occurred."
+        rm -f "$temp_file" "$old_binary_backup"
+        exit 1
+    fi
+
+    # Extract new version
+    log_info "Extracting archive to $version_dir..."
+    mkdir -p "$version_dir"
+    if ! tar -xzf "$temp_file" -C "$version_dir"; then
+        log_error "Extraction failed. Service is still running - no disruption occurred."
+        rm -f "$temp_file" "$old_binary_backup"
+        exit 1
+    fi
+    log_success "Extraction completed"
+    rm -f "$temp_file"
+
+    # Make binary executable
+    make_executable "$version_dir"
+
+    # Verify the new binary exists and is executable
+    local new_binary="${version_dir}/cli-proxy-api"
+    if [[ ! -f "$new_binary" ]] && [[ -f "${version_dir}/CLIProxyAPI" ]]; then
+        new_binary="${version_dir}/CLIProxyAPI"
+    fi
+    if [[ ! -x "$new_binary" ]]; then
+        log_error "New binary not found or not executable in extracted archive"
+        rollback_upgrade "$current_version" "$old_binary_backup"
+        rm -f "$old_binary_backup"
+        exit 1
+    fi
+
+    # ============================================================
+    # PHASE 2: Stop service, swap binary, configure (atomic window)
+    # ============================================================
+    local upgrade_failed=false
+
+    # Backup existing configuration
+    local backup_file=""
+    if [[ "$is_upgrade" == true ]]; then
+        backup_file=$(backup_config)
+    fi
+
+    # Stop service only after new version is fully prepared
     if [[ "$is_upgrade" == true ]]; then
         if is_service_running; then
             stop_service
@@ -783,55 +923,64 @@ install_cliproxyapi() {
             stop_cliproxyapi_processes
         fi
     fi
-    
-    # Backup existing configuration if upgrading
-    local backup_file=""
-    if [[ "$is_upgrade" == true ]]; then
-        backup_file=$(backup_config)
-    fi
-    
-    # Create installation directory
-    local version_dir="${INSTALL_DIR}/${version}"
-    mkdir -p "$INSTALL_DIR"
-    
-    # Download and extract
-    local temp_file
-    temp_file=$(mktemp)
-    
-    download_file "$download_url" "$temp_file"
-    extract_archive "$temp_file" "$version_dir"
-    
-    # Cleanup temp file
-    rm -f "$temp_file"
-    
-    # Make binary executable
-    make_executable "$version_dir"
-    
-    # Setup configuration and copy executable to main directory
-    setup_config "$version_dir" "$backup_file"
-    
-    # Make main executable executable
+
+    # Copy new binary and setup configuration
+    cp "$new_binary" "${INSTALL_DIR}/cli-proxy-api"
     chmod +x "${INSTALL_DIR}/cli-proxy-api"
-    
+    log_success "Copied executable to ${INSTALL_DIR}/cli-proxy-api"
+
+    # Setup configuration (preserves existing user config)
+    setup_config "$version_dir" "$backup_file"
+
     # Create/update systemd service file
     create_systemd_service "$INSTALL_DIR"
-    
-    # Write version file
-    write_version_file "$INSTALL_DIR" "$version"
-    
-    # Clean up old versions
-    cleanup_old_versions "$version"
-    
-    # Restart service if it was running before upgrade
+
+    # ============================================================
+    # PHASE 3: Start service and verify
+    # ============================================================
     if [[ "$is_upgrade" == true && "$service_was_running" == true ]]; then
-        restart_service
+        if ! restart_service; then
+            upgrade_failed=true
+        fi
+
+        # Verify service is actually running
+        sleep 2
+        if ! is_service_running; then
+            log_warning "New version failed to start, initiating rollback..."
+            upgrade_failed=true
+        fi
     fi
-    
+
+    # Rollback if service failed to start
+    if [[ "$upgrade_failed" == true ]]; then
+        log_error "Upgrade to $version failed. Rolling back..."
+        rollback_upgrade "$current_version" "$old_binary_backup"
+        rm -f "$old_binary_backup"
+
+        # Clean up failed version directory
+        rm -rf "$version_dir"
+        log_error "Upgrade failed and has been rolled back to version $current_version"
+        exit 1
+    fi
+
+    # ============================================================
+    # PHASE 4: Finalize (only after service confirmed running)
+    # ============================================================
+
+    # Write version file (after successful restart)
+    write_version_file "$INSTALL_DIR" "$version"
+
+    # Clean up old versions (only after everything is confirmed working)
+    cleanup_old_versions "$version"
+
+    # Remove rollback backup
+    rm -f "$old_binary_backup"
+
     # Success message
     if [[ "$is_upgrade" == true ]]; then
         log_success "CLIProxyAPI upgraded from $current_version to $version!"
         log_info "Installation directory: $INSTALL_DIR"
-        
+
         if [[ "$service_was_running" == true ]]; then
             log_info "Service has been restarted automatically"
         elif is_service_running; then
@@ -839,7 +988,7 @@ install_cliproxyapi() {
         else
             log_info "To start the service: systemctl --user start cliproxyapi.service"
         fi
-        
+
         # Check if this is the first time setup (no existing config)
         if [[ ! -f "${INSTALL_DIR}/config.yaml" ]]; then
             show_authentication_info
@@ -851,7 +1000,7 @@ install_cliproxyapi() {
     else
         log_success "CLIProxyAPI $version installed successfully!"
         log_info "Installation directory: $INSTALL_DIR"
-        
+
         # Show authentication information for first-time setup
         show_authentication_info
         show_quick_start "$INSTALL_DIR"
@@ -941,13 +1090,12 @@ uninstall_cliproxyapi() {
     log_success "CLIProxyAPI has been uninstalled successfully"
 }
 
-# Cleanup function on exit
+# Cleanup function on exit - only clean our own temp files
+OUR_TEMP_FILES=()
 cleanup() {
-    local temp_files
-    temp_files=$(find /tmp -name "tmp.*" -user "$(whoami)" 2>/dev/null || true)
-    if [[ -n "$temp_files" ]]; then
-        echo "$temp_files" | xargs rm -f 2>/dev/null || true
-    fi
+    for f in "${OUR_TEMP_FILES[@]}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
 }
 
 # Set up cleanup trap
