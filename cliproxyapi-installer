@@ -10,6 +10,7 @@ set -euo pipefail
 REPO_OWNER="router-for-me"
 REPO_NAME="CLIProxyAPI"
 INSTALL_DIR="$HOME/cliproxyapi"
+OUR_TEMP_FILES=()
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
 SCRIPT_NAME="cliproxyapi-installer"
 
@@ -532,7 +533,7 @@ start_service() {
 # Restart systemd service (returns non-zero on failure)
 restart_service() {
     log_info "Restarting CLIProxyAPI service..."
-    systemctl --user restart cliproxyapi.service
+    systemctl --user restart cliproxyapi.service || true
 
     # Wait a moment and check if it started successfully
     sleep 2
@@ -669,7 +670,7 @@ download_file() {
         fi
 
         if command -v curl >/dev/null 2>&1; then
-            curl -L --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 -o "$output" "$url"
+            curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 600 -o "$output" "$url"
         else
             wget -O "$output" "$url"
         fi
@@ -770,6 +771,7 @@ make_executable() {
 rollback_upgrade() {
     local old_version="$1"
     local old_binary_backup="$2"
+    local should_restart="${3:-false}"
 
     log_warning "Rolling back to version $old_version..."
 
@@ -786,16 +788,20 @@ rollback_upgrade() {
         log_info "Restored version.txt to $old_version"
     fi
 
-    # Try to restart old service
-    if systemctl --user start cliproxyapi.service 2>/dev/null; then
-        sleep 2
-        if is_service_running; then
-            log_success "Service restored and running (version $old_version)"
+    # Only restart service if it was running before the upgrade attempt
+    if [[ "$should_restart" == "true" ]]; then
+        if systemctl --user start cliproxyapi.service 2>/dev/null; then
+            sleep 2
+            if is_service_running; then
+                log_success "Service restored and running (version $old_version)"
+            else
+                log_warning "Service restored but may not be running. Check: systemctl --user status cliproxyapi.service"
+            fi
         else
-            log_warning "Service restored but may not be running. Check: systemctl --user status cliproxyapi.service"
+            log_warning "Could not restart service. Run manually: systemctl --user start cliproxyapi.service"
         fi
     else
-        log_warning "Could not restart service. Run manually: systemctl --user start cliproxyapi.service"
+        log_info "Service was not running before upgrade, skipping restart"
     fi
 }
 
@@ -856,6 +862,7 @@ install_cliproxyapi() {
     if [[ "$is_upgrade" == true ]] && [[ -f "${INSTALL_DIR}/cli-proxy-api" ]]; then
         old_binary_backup="${INSTALL_DIR}/.cli-proxy-api.rollback"
         cp "${INSTALL_DIR}/cli-proxy-api" "$old_binary_backup"
+        OUR_TEMP_FILES+=("$old_binary_backup")
         log_info "Backed up current binary for rollback"
     fi
 
@@ -898,7 +905,7 @@ install_cliproxyapi() {
     fi
     if [[ ! -x "$new_binary" ]]; then
         log_error "New binary not found or not executable in extracted archive"
-        rollback_upgrade "$current_version" "$old_binary_backup"
+        rollback_upgrade "$current_version" "$old_binary_backup" "$service_was_running"
         rm -f "$old_binary_backup"
         exit 1
     fi
@@ -954,7 +961,7 @@ install_cliproxyapi() {
     # Rollback if service failed to start
     if [[ "$upgrade_failed" == true ]]; then
         log_error "Upgrade to $version failed. Rolling back..."
-        rollback_upgrade "$current_version" "$old_binary_backup"
+        rollback_upgrade "$current_version" "$old_binary_backup" "$service_was_running"
         rm -f "$old_binary_backup"
 
         # Clean up failed version directory
@@ -1091,7 +1098,6 @@ uninstall_cliproxyapi() {
 }
 
 # Cleanup function on exit - only clean our own temp files
-OUR_TEMP_FILES=()
 cleanup() {
     for f in "${OUR_TEMP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null || true
