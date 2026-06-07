@@ -391,7 +391,17 @@ extract_release_info() {
         expected_filename="${expected_filename}.tar.gz"
     fi
     
-    download_url=$(echo "$release_info" | grep -o "\"browser_download_url\": *\"[^\"]*${expected_filename}[^\"]*\"" | cut -d'"' -f4)
+    download_url=$(
+        echo "$release_info" |
+            grep -o '"browser_download_url": *"[^"]*"' |
+            cut -d'"' -f4 |
+            while IFS= read -r url; do
+                if [[ "$(basename "$url")" == "$expected_filename" ]]; then
+                    echo "$url"
+                    break
+                fi
+            done
+    )
     
     if [[ -z "$download_url" ]]; then
         log_error "Failed to find download URL for ${expected_filename}"
