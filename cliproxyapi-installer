@@ -42,6 +42,11 @@ log_step() {
     echo -e "${CYAN}[STEP]${NC} $1"
 }
 
+find_versions() {
+    local indent=$(printf "%*s" $((${1:-0} * 2)));
+    find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -exec sh -c 'echo "'"$indent"'$(basename {})"' \; | sort -V
+}
+
 # Display authentication information for first-time setup
 show_authentication_info() {
     echo
@@ -289,10 +294,15 @@ show_quick_start() {
         echo -e "${BLUE}4. Start the service:${NC}"
         echo -e "   ${CYAN}./cli-proxy-api${NC}"
         echo
-        echo -e "${BLUE}5. Or run as a systemd service:${NC}"
-        echo -e "   ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user start cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "${BLUE}5. Or run as a systemd/openrc service:${NC}"
+        echo -e "   systemd:"
+        echo -e "      ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
+        echo -e "      ${CYAN}systemctl --user start cliproxyapi.service${NC}"
+        echo -e "      ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "   openrc:"
+        echo -e "      ${CYAN}rc-update add cliproxyapi default${NC}"
+        echo -e "      ${CYAN}rc-service cliproxyapi start${NC}"
+        echo -e "      ${CYAN}rc-service cliproxyapi status${NC}"
         echo
         echo -e "${BLUE}6. Read the full documentation:${NC}"
         echo -e "   ${CYAN}https://github.com/router-for-me/CLIProxyAPI${NC}"
@@ -300,10 +310,15 @@ show_quick_start() {
         echo -e "${BLUE}3. Start the service:${NC}"
         echo -e "   ${CYAN}./cli-proxy-api${NC}"
         echo
-        echo -e "${BLUE}4. Or run as a systemd service:${NC}"
-        echo -e "   ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user start cliproxyapi.service${NC}"
-        echo -e "   ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "${BLUE}4. Or run as a systemd/openrc service:${NC}"
+        echo -e "   systemd:"
+        echo -e "      ${CYAN}systemctl --user enable cliproxyapi.service${NC}"
+        echo -e "      ${CYAN}systemctl --user start cliproxyapi.service${NC}"
+        echo -e "      ${CYAN}systemctl --user status cliproxyapi.service${NC}"
+        echo -e "   openrc:"
+        echo -e "      ${CYAN}rc-update add cliproxyapi default${NC}"
+        echo -e "      ${CYAN}rc-service cliproxyapi start${NC}"
+        echo -e "      ${CYAN}rc-service cliproxyapi status${NC}"
         echo
         echo -e "${BLUE}5. Read the full documentation:${NC}"
         echo -e "   ${CYAN}https://github.com/router-for-me/CLIProxyAPI${NC}"
@@ -340,11 +355,16 @@ check_dependencies() {
         missing_tools+=("tar")
     fi
 
+    if ! command -v systemctl >/dev/null 2>&1 && ! command -v openrc >/dev/null 2>&1; then
+        missing_tools+=("systemd or openrc")
+    fi
+
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         log_error "Missing required tools: ${missing_tools[*]}"
         log_info "Please install the missing tools and try again"
         log_info "On Ubuntu/Debian: sudo apt-get install curl wget tar"
         log_info "On CentOS/RHEL: sudo yum install curl wget tar"
+        log_info "On Alpine Linux: sudo apk add curl wget tar openrc"
         exit 1
     fi
 }
@@ -469,7 +489,11 @@ restore_config() {
 
 # Check if systemd service is running
 is_service_running() {
-    systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
+    else
+        rc-service cliproxyapi status 2>/dev/null
+    fi
 }
 
 # Check if any CLIProxyAPI processes are running
@@ -518,7 +542,11 @@ stop_cliproxyapi_processes() {
 stop_service() {
     if is_service_running; then
         log_info "Stopping CLIProxyAPI service..."
-        systemctl --user stop cliproxyapi.service
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user stop cliproxyapi.service
+        else
+            rc-service cliproxyapi stop
+        fi
         log_success "Service stopped"
     else
         log_info "Service is not running"
@@ -528,29 +556,110 @@ stop_service() {
 # Start systemd service
 start_service() {
     log_info "Starting CLIProxyAPI service..."
-    systemctl --user start cliproxyapi.service
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user start cliproxyapi.service
+    else
+        rc-service cliproxyapi start
+    fi
     
     # Wait a moment and check if it started successfully
     sleep 2
     if is_service_running; then
         log_success "Service started successfully"
-    else
+    elif command -v systemctl >/dev/null 2>&1; then
         log_warning "Service may not have started properly. Check with: systemctl --user status cliproxyapi.service"
+    else
+        log_warning "Service may not have started properly. Check with: rc-service cliproxyapi status"
     fi
 }
 
 # Restart systemd service
 restart_service() {
     log_info "Restarting CLIProxyAPI service..."
-    systemctl --user restart cliproxyapi.service
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user restart cliproxyapi.service
+    else
+        rc-service cliproxyapi restart
+    fi
     
     # Wait a moment and check if it started successfully
     sleep 2
     if is_service_running; then
         log_success "Service restarted successfully"
-    else
+    elif command -v systemctl >/dev/null 2>&1; then
         log_warning "Service may not have started properly. Check with: systemctl --user status cliproxyapi.service"
+    else
+        log_warning "Service may not have started properly. Check with: rc-service cliproxyapi status"
     fi
+}
+
+create_openrc_service() {
+    local install_dir="$1"
+    local service_name="cliproxyapi"
+    local service_file="${install_dir}/${service_name}.openrc"
+    local openrc_dir="/etc/init.d"
+    local openrc_service_file="${openrc_dir}/${service_name}"
+
+    local service_user="$(whoami)"
+    local service_home
+
+    if command -v getent >/dev/null 2>&1; then
+        service_home="$(getent passwd "$service_user" | cut -d: -f6)"
+    fi
+    service_home="${service_home:-$HOME}"
+
+    log_info "Creating OpenRC service file..."
+
+    cat > "$service_file" << EOF
+#!/sbin/openrc-run
+
+name="CLIProxyAPI"
+description="CLIProxyAPI Service"
+
+command="${install_dir}/cli-proxy-api"
+directory="${install_dir}"
+command_user="${service_user}"
+
+# Use OpenRC supervise-daemon to mimic systemd Restart=always
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+respawn_period=60
+
+output_log="/var/log/\${RC_SVCNAME}.log"
+error_log="/var/log/\${RC_SVCNAME}.err"
+
+depend() {
+    need net
+}
+
+start_pre() {
+    export HOME="${service_home}"
+
+    checkpath -f -m 0644 -o "\$command_user" "\$output_log"
+    checkpath -f -m 0644 -o "\$command_user" "\$error_log"
+}
+EOF
+
+    chmod +x "$service_file"
+
+    # Install to OpenRC init directory
+    if [ "$(id -u)" -eq 0 ]; then
+        cp "$service_file" "$openrc_service_file"
+        chmod +x "$openrc_service_file"
+        rc-update add ${service_name} default || log_warning "Could not reload openrc daemon (this is normal on first run)"
+    else
+        sudo cp "$service_file" "$openrc_service_file"
+        sudo chmod +x "$openrc_service_file"
+        sudo rc-update add ${service_name} default || log_warning "Could not reload openrc daemon (this is normal on first run)"
+    fi
+
+    log_success "OpenRC service file created: $service_file"
+    log_success "OpenRC service installed: $openrc_service_file"
+    log_info "To enable and start the service:"
+    log_info "  sudo rc-update add ${service_name} default"
+    log_info "  sudo rc-service ${service_name} start"
+    log_info "  sudo rc-service ${service_name} status"
 }
 
 # Create systemd service file
@@ -714,7 +823,7 @@ cleanup_old_versions() {
     
     # Get all version directories, sort them, and remove all but the latest 2
     local old_versions
-    old_versions=$(find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -printf "%f\n" | sort -V | head -n -2)
+    old_versions=$(find_versions | head -n -2)
     
     if [[ -n "$old_versions" ]]; then
         echo "$old_versions" | while read -r version; do
@@ -824,7 +933,11 @@ install_cliproxyapi() {
     chmod +x "${INSTALL_DIR}/cli-proxy-api"
     
     # Create/update systemd service file
-    create_systemd_service "$INSTALL_DIR"
+    if command -v systemctl >/dev/null 2>&1; then
+        create_systemd_service "$INSTALL_DIR"
+    else
+        create_openrc_service "$INSTALL_DIR"
+    fi
     
     # Write version file
     write_version_file "$INSTALL_DIR" "$version"
@@ -846,8 +959,10 @@ install_cliproxyapi() {
             log_info "Service has been restarted automatically"
         elif is_service_running; then
             log_info "Service is running"
-        else
+        elif command -v systemctl >/dev/null 2>&1; then
             log_info "To start the service: systemctl --user start cliproxyapi.service"
+        else
+            log_info "To start the service: rc-service cliproxyapi start"
         fi
         
         # Check if this is the first time setup (no existing config)
@@ -913,7 +1028,7 @@ show_status() {
         # Show available versions
         if [[ -d "$INSTALL_DIR" ]]; then
             echo "Installed Versions:"
-            find "$INSTALL_DIR" -maxdepth 1 -type d -name "*.*.*" -printf "  %f\n" | sort -V
+            find_versions 1
         fi
     else
         echo "Status: Not installed"
