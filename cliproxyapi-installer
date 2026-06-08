@@ -328,6 +328,48 @@ detect_linux_arch() {
     esac
 }
 
+# Check whether the host is OpenWrt.
+is_openwrt_system() {
+    if [[ -f /etc/openwrt_release ]]; then
+        return 0
+    fi
+
+    if [[ -f /etc/os-release ]] && grep -qi 'openwrt' /etc/os-release; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check whether the host uses musl libc.
+is_musl_system() {
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'musl'; then
+        return 0
+    fi
+
+    if [[ -f /etc/alpine-release ]]; then
+        return 0
+    fi
+
+    local musl_loader
+    for musl_loader in /lib/ld-musl-*.so* /usr/lib/ld-musl-*.so*; do
+        if [[ -e "$musl_loader" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Select the Linux release asset variant for this host.
+detect_linux_asset_variant() {
+    if is_openwrt_system || is_musl_system; then
+        echo "no-plugin"
+    else
+        echo "default"
+    fi
+}
+
 # Check if required tools are available
 check_dependencies() {
     local missing_tools=()
@@ -372,6 +414,7 @@ fetch_release_info() {
 extract_release_info() {
     local release_info="$1"
     local os_arch="$2"
+    local asset_variant="${3:-default}"
     
     local version
     version=$(echo "$release_info" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
@@ -383,6 +426,10 @@ extract_release_info() {
     
     local expected_filename="CLIProxyAPI_${version}_${os_arch}"
     local download_url=""
+
+    if [[ "$asset_variant" == "no-plugin" ]]; then
+        expected_filename="${expected_filename}_no-plugin"
+    fi
     
     # Handle different file extensions
     if [[ "$os_arch" == windows_* ]]; then
@@ -408,7 +455,7 @@ extract_release_info() {
         exit 1
     fi
     
-    echo "${version}|${download_url}"
+    echo "${version}|${download_url}|${expected_filename}"
 }
 
 # Check if CLIProxyAPI is already installed
@@ -422,6 +469,21 @@ get_current_version() {
         cat "${INSTALL_DIR}/version.txt" 2>/dev/null || echo "unknown"
     else
         echo "none"
+    fi
+}
+
+# Get current installed release asset variant
+get_current_asset_variant() {
+    if [[ -f "${INSTALL_DIR}/asset-variant.txt" ]]; then
+        local asset_variant
+        asset_variant=$(cat "${INSTALL_DIR}/asset-variant.txt" 2>/dev/null || true)
+        if [[ -n "$asset_variant" ]]; then
+            echo "$asset_variant"
+        else
+            echo "unknown"
+        fi
+    else
+        echo "unknown"
     fi
 }
 
@@ -702,6 +764,15 @@ write_version_file() {
     log_success "Version $version written to version.txt"
 }
 
+# Write release asset variant file
+write_asset_variant_file() {
+    local install_dir="$1"
+    local asset_variant="$2"
+
+    echo "$asset_variant" > "${install_dir}/asset-variant.txt"
+    log_success "Release asset variant $asset_variant written to asset-variant.txt"
+}
+
 # Clean up old versions (keep last 2 versions)
 cleanup_old_versions() {
     local current_version="$1"
@@ -742,6 +813,8 @@ make_executable() {
 install_cliproxyapi() {
     local current_version
     current_version=$(get_current_version)
+    local current_asset_variant
+    current_asset_variant=$(get_current_asset_variant)
     local is_upgrade=false
     local service_was_running=false
     
@@ -765,6 +838,14 @@ install_cliproxyapi() {
     local os_arch
     os_arch=$(detect_linux_arch)
     log_step "Detected platform: $os_arch"
+
+    local asset_variant
+    asset_variant=$(detect_linux_asset_variant)
+    if [[ "$asset_variant" == "no-plugin" ]]; then
+        log_step "Selected asset variant: no-plugin (portable Linux build, dynamic library plugins disabled)"
+    else
+        log_step "Selected asset variant: default (dynamic library plugins enabled)"
+    fi
     
     # Fetch release info
     local release_info
@@ -772,16 +853,22 @@ install_cliproxyapi() {
     
     # Extract version and download URL
     local release_data
-    release_data=$(extract_release_info "$release_info" "$os_arch")
+    release_data=$(extract_release_info "$release_info" "$os_arch" "$asset_variant")
     local version=$(echo "$release_data" | cut -d'|' -f1)
     local download_url=$(echo "$release_data" | cut -d'|' -f2)
+    local asset_filename=$(echo "$release_data" | cut -d'|' -f3)
     
     log_step "Latest version: $version"
+    log_step "Release asset: $asset_filename"
     
     # Check if already up to date
-    if [[ "$is_upgrade" == true && "$current_version" == "$version" ]]; then
+    if [[ "$is_upgrade" == true && "$current_version" == "$version" && "$current_asset_variant" == "$asset_variant" ]]; then
         log_success "CLIProxyAPI is already up to date (version $version)"
         return
+    fi
+
+    if [[ "$is_upgrade" == true && "$current_version" == "$version" && "$current_asset_variant" != "$asset_variant" ]]; then
+        log_info "Installed asset variant is $current_asset_variant, reinstalling $version with $asset_variant asset"
     fi
     
     # Stop service and processes if running (for upgrades)
@@ -828,6 +915,9 @@ install_cliproxyapi() {
     
     # Write version file
     write_version_file "$INSTALL_DIR" "$version"
+
+    # Write release asset variant file
+    write_asset_variant_file "$INSTALL_DIR" "$asset_variant"
     
     # Clean up old versions
     cleanup_old_versions "$version"
@@ -839,8 +929,13 @@ install_cliproxyapi() {
     
     # Success message
     if [[ "$is_upgrade" == true ]]; then
-        log_success "CLIProxyAPI upgraded from $current_version to $version!"
+        if [[ "$current_version" == "$version" ]]; then
+            log_success "CLIProxyAPI $version reinstalled with $asset_variant asset!"
+        else
+            log_success "CLIProxyAPI upgraded from $current_version to $version!"
+        fi
         log_info "Installation directory: $INSTALL_DIR"
+        log_info "Release asset variant: $asset_variant"
         
         if [[ "$service_was_running" == true ]]; then
             log_info "Service has been restarted automatically"
@@ -861,6 +956,7 @@ install_cliproxyapi() {
     else
         log_success "CLIProxyAPI $version installed successfully!"
         log_info "Installation directory: $INSTALL_DIR"
+        log_info "Release asset variant: $asset_variant"
         
         # Show authentication information for first-time setup
         show_authentication_info
@@ -894,6 +990,8 @@ show_status() {
         else
             echo "Executable: Missing"
         fi
+
+        echo "Release Asset Variant: $(get_current_asset_variant)"
         
         if [[ -f "${INSTALL_DIR}/cliproxyapi.service" ]]; then
             echo "Systemd Service: Available"
@@ -1056,6 +1154,7 @@ Description:
 
 Features:
   - Automatic Linux architecture detection (amd64/aarch64)
+  - Automatic Linux release asset selection for GLIBC and OpenWrt/musl systems
   - Downloads latest version from GitHub releases
   - Preserves configuration during upgrades
   - Automatic API key generation

@@ -5,6 +5,7 @@ A comprehensive Linux installation script for [CLIProxyAPI](https://github.com/r
 ## Features
 
 - 🚀 **Automatic Installation** - Detects your Linux architecture and downloads the latest version
+- 🧩 **Linux Asset Selection** - Uses the plugin-capable GLIBC build by default, and automatically selects the portable `no-plugin` build on OpenWrt/musl systems
 - 🔄 **Smart Upgrades** - Preserves your configuration and automatically manages systemd service during upgrades
 - 🔑 **API Key Management** - Automatically generates secure API keys
 - 🛡️ **Systemd Service** - Creates and manages systemd service files with proper lifecycle management
@@ -150,6 +151,13 @@ Add `--no-browser` to any login command to print the URL instead of opening a br
 - **Operating System**: Linux (amd64, arm64)
 - **Required Tools**: `curl` or `wget`, `tar`
 - **Shell**: Bash
+
+### Linux Release Assets
+
+The installer chooses the correct Linux release asset automatically:
+
+- GLIBC systems use `CLIProxyAPI_<version>_linux_<arch>.tar.gz`, which keeps dynamic library plugin support enabled.
+- OpenWrt and other musl-based systems use `CLIProxyAPI_<version>_linux_<arch>_no-plugin.tar.gz`, which is portable but does not support dynamic library plugins.
 
 ### Installing Dependencies
 
