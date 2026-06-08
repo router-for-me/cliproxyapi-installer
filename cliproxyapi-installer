@@ -871,16 +871,6 @@ install_cliproxyapi() {
         log_info "Installed asset variant is $current_asset_variant, reinstalling $version with $asset_variant asset"
     fi
     
-    # Stop service and processes if running (for upgrades)
-    if [[ "$is_upgrade" == true ]]; then
-        if is_service_running; then
-            stop_service
-        fi
-        if is_cliproxyapi_running; then
-            stop_cliproxyapi_processes
-        fi
-    fi
-    
     # Backup existing configuration if upgrading
     local backup_file=""
     if [[ "$is_upgrade" == true ]]; then
@@ -896,6 +886,19 @@ install_cliproxyapi() {
     temp_file=$(mktemp)
     
     download_file "$download_url" "$temp_file"
+
+    # Stop service and processes if running (for upgrades)
+    # Must happen after download but before extract, because extract
+    # overwrites the running binary ("Text file busy" on Linux).
+    if [[ "$is_upgrade" == true ]]; then
+        if is_service_running; then
+            stop_service
+        fi
+        if is_cliproxyapi_running; then
+            stop_cliproxyapi_processes
+        fi
+    fi
+
     extract_archive "$temp_file" "$version_dir"
     
     # Cleanup temp file
